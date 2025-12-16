@@ -149,3 +149,20 @@ def engine_reply_move(
         m = result.move
         san = board.san(m)
         return mode, m, san
+
+def start_engine(engine_path: str | None, elo: int) -> tuple[chess.engine.SimpleEngine, str]:
+    path = find_stockfish(engine_path)
+    engine = chess.engine.SimpleEngine.popen_uci(path)
+    mode = configure_strength(engine, elo)
+    return engine, mode
+
+def stop_engine(engine: chess.engine.SimpleEngine | None) -> None:
+    if engine is None:
+        return
+    try:
+        engine.quit()
+    except Exception:
+        pass
+
+
+

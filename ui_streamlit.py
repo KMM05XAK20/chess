@@ -3,20 +3,49 @@ import chess
 import chess.engine
 import chess.svg
 import streamlit.components.v1 as components
-from chess_core import parse_user_move, suggest_topk, engine_reply_move
+import shutil
+from chess_core import start_engine, stop_engine, parse_user_move, suggest_topk, engine_reply_move
 from fen_hint import find_stockfish, configure_strength
 
 st.set_page_config(page_title="Chess Helper", layout="centered")
 st.title("♟️ Chess Helper (подсказчик + игра)")
 
+# =========================
+# Session state INIT
+# =========================
 
-# --------- Состояние доски
+if "engine" not in st.session_state:
+    st.session_state.engine = None
+
+if "engine_mode" not in st.session_state:
+    st.session_state.engine_mode = ""
+    
 if "board" not in st.session_state:
     st.session_state.board = chess.Board()
+
+if "last_move" not in st.session_state:
+    st.session_state.last_move = None
+
 if "log" not in st.session_state:
     st.session_state.log = []
 
+if "suggestions" not in st.session_state:
+    st.session_state.suggestions = []
+# =========================
+
+def require_engine(engine_path: str | None, elo: int):
+
+    if st.session_state.engine is None:
+        eng, mode = start_engine(engine_path, elo)
+        st.session_state.engine = eng
+        st.session_state.engine_mode = mode
+    return st.session_state.engine, st.session_state.engine_mode
+        
+
+# --------- Состояние доски
+
 board: chess.Board = st.session_state.board
+
 
 # --------- Отображение
 st.subheader("Позиция")
@@ -24,53 +53,133 @@ st.code(board.fen())
 st.text(str(board))
 
 last = st.session_state.get("last_move")
-
 svg_bytes = chess.svg.board(board=board, size=420, lastmove=last,)
 components.html(svg_bytes, height=460, width=460)
 with st.expander("Показать текстовую доску"):
     st.text(str(board))
 
 
+
+def get_engine(engine_path: str | None, elo: int):
+    if "engine" not in st.session_state:
+        eng, mode = start_engine(engine_path, elo)
+        st.session_state.engine = eng
+        st.session_state.engine_mode = mode
+    return st.session_state.engine, st.session_state.engine_mode
+
+@st.cache_resource
+def get_engine_cache(engine_path: str | None, elo: int) -> tuple[chess.engine.SimpleEngine, str]:
+    path = engine_path or shutil.which("stockfish")
+    if not path:
+        raise RuntimeError("Stockfish не найден. Установи: brew install stockfish")
+    
+    eng = chess.engine.SimpleEngine.popen_uci(path)
+
+    mode = configure_strength(eng, elo)
+    return eng, mode
+
+
 # --------- Настройки справа
 with st.sidebar:
     st.header("Настройки")
-    engine_path = st.text_input("Путь к Stockfish (если не в PATH)", value="")
-    elo = st.slider("Целевой Elo (будет клампиться)", min_value=800, max_value=2000, value=1000, step=50)
-    think_ms = st.slider("Время на ход (мс)", min_value=20, max_value=1000, value=200, step=10)
-    topk = st.slider("Сколько подсказок", min_value=1, max_value=5, value=3)
+    engine_path = st.text_input("Путь к Stockfish (если не в PATH)", value="", key="engine_path")
+    elo = st.slider("Целевой Elo (клампится)", 800, 2000, 1000, 50, key="elo")
+    think_ms = st.slider("Время на ход (мс)", 20, 1000, 200, 10, key="think_ms")
+    topk = st.slider("Подсказок", 1, 5, 3, key="topk")
 
 engine_path = engine_path.strip() or None
 
+sig = (engine_path, elo)
 
+if "engine_sig" not in st.session_state:
+    st.session_state.engine_sig = sig
+elif st.session_state.engine_sig != sig:
+    get_engine_cache.clear()
+    st.session_state.engine_sig = sig
 
 
 col1, col2, col3 = st.columns(3)
 with col1:
     if st.button("Сброс"):
+        stop_engine(st.session_state.engine)
+        st.session_state.engine = None
+        st.session_state.engine_mode = ""
         st.session_state.board = chess.Board()
         st.session_state.log = []
+        st.session_state.last_move = None
+        st.rerun()
+    if st.button("Undo"):
+        board.pop()
+        st.session_state.last_move = board.peek() if board.move_stack else None
+        st.session_state.log.append("↩️ Undo")
         st.rerun()
 
 with col2:
     if st.button("Подсказки"):
         try:
-            pack = suggest_topk(board, engine_path, elo, think_ms, k=topk)
-            st.info(f"[engine] {pack.mode}, think_ms={pack.think_ms}")
-            for i, line in enumerate(pack.lines, start=1):
-                eval_txt = "mate/unknown" if line.score_cp is None else f"{line.score_cp:+d} cp"
-                st.write(f"{i}) **{line.move_san}**  ({line.move_uci}) — {eval_txt}")
+            engine, mode = get_engine(engine_path, elo)
+            limit = chess.engine.Limit(time=think_ms / 1000.0)
+
+            infos = engine.analyse(board, limit, multipv=topk) if topk > 1 else [engine.analyse(board, limit)]
+            infos = sorted(infos, key=lambda d: d.get("multipv", 1))
+
+            st.session_state.suggestions = []
+            for info in infos:
+                pv = info.get("pv")
+                if not pv:
+                    continue
+                m = pv[0]
+                san = board.san(m)
+                st.session_state.suggestions.append(m.uci())
+
+            if st.session_state.suggestions:
+                st.subheader("Подсказки (кликни чтобы сделать ход)")
+                for uci in st.session_state.suggestions:
+                    m = chess.Move.from_uci(uci)
+                    label = board.san(m) if m in board.legal_moves else uci
+                    if st.button(f"➡️ {label} ({uci})", key=f"sug_{uci}"):
+                        # применяем ход
+                        san = board.san(m)
+                        board.push(m)
+                        st.session_state.last_move = m
+                        st.session_state.log.append(f"💡 Подсказка: {san} ({uci})")
+                        st.rerun()
+
+
+            st.info(f"[engine] {mode}, think_ms={think_ms}")
+            for i, info in enumerate(infos, start=1):
+                pv = info.get("pv")
+                if not pv:
+                    continue
+                m = pv[0]
+                san = board.san(m)
+                score = info.get("score")
+                cp = None
+                if score is not None:
+                    val = score.pov(board.turn).score(mate_score=100000)
+                    cp = int(val) if val is not None else None
+                eval_txt = "mate/unknown" if cp is None else f"{cp:+d} cp"
+                st.write(f"{i}) **{san}** ({m.uci()}) — {eval_txt}")
         except Exception as e:
             st.error(str(e))
 
 with col3:
     if st.button("Ход движка"):
         try:
-            mode, m, san = engine_reply_move(board, engine_path, elo, think_ms)
+            engine, mode = get_engine(engine_path, elo)
+            engine, mode = get_engine_cache(engine_path, elo)
+            engine, mode = require_engine(engine_path, elo)
+            limit = chess.engine.Limit(time=think_ms / 1000.0)
+            result = engine.play(board, limit)
+            m = result.move
+            san = board.san(m)
             board.push(m)
+            st.session_state.last_move = m
             st.session_state.log.append(f"🤖 {san} ({m.uci()}) [{mode}]")
             st.rerun()
         except Exception as e:
             st.error(str(e))
+
 
 st.subheader("Сделать ход")
 move_text = st.text_input("Ваш ход (SAN или UCI)", value="", placeholder="например: e4 или g1f3")
@@ -80,6 +189,7 @@ if st.button("Применить ход"):
         m = parse_user_move(board, move_text)
         san = board.san(m)
         board.push(m)
+        st.session_state.last_move = m
         st.session_state.log.append(f"🙂 {san} ({m.uci()})")
         st.rerun()
     except Exception as e:
@@ -102,11 +212,4 @@ for line in st.session_state.log[-20:]:
 if board.is_game_over():
     st.success(f"Игра окончена: {board.result()}")
 
-
-def get_engine(engine_path, elo):
-    if "engine" not in st.session_state:
-        path = find_stockfish(engine_path)
-        eng = chess.engine.SimpleEngine.popen_uci(path)
-        st.session_state.engine = eng
-        st.session_state.engine_mode = configure_strength(eng, elo)
-    return st.session_state.engine, st.session_state.engine_mode
+st.sidebar.write("engine is None?", st.session_state.engine is None)
