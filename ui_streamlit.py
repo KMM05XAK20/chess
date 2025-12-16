@@ -1,10 +1,10 @@
 import streamlit as st
 import chess
-
+import chess.engine
 import chess.svg
 import streamlit.components.v1 as components
 from chess_core import parse_user_move, suggest_topk, engine_reply_move
-
+from fen_hint import find_stockfish, configure_strength
 
 st.set_page_config(page_title="Chess Helper", layout="centered")
 st.title("♟️ Chess Helper (подсказчик + игра)")
@@ -23,7 +23,9 @@ st.subheader("Позиция")
 st.code(board.fen())
 st.text(str(board))
 
-svg_bytes = chess.svg.board(board=board, size=420)
+last = st.session_state.get("last_move")
+
+svg_bytes = chess.svg.board(board=board, size=420, lastmove=last,)
 components.html(svg_bytes, height=460, width=460)
 with st.expander("Показать текстовую доску"):
     st.text(str(board))
@@ -83,9 +85,28 @@ if st.button("Применить ход"):
     except Exception as e:
         st.error(str(e))
 
+if st.button("Отменить ход"):
+    if board.move_stack:
+        board.pop()
+        st.rerun()
+
+try:
+    st.session_state.board = chess.Board(move_text) #???? fen_text - not found, fen_text or move_text???
+except ValueError:
+    st.error("Неверный FEN")
+
 st.subheader("Лог ходов")
 for line in st.session_state.log[-20:]:
     st.write(line)
 
 if board.is_game_over():
     st.success(f"Игра окончена: {board.result()}")
+
+
+def get_engine(engine_path, elo):
+    if "engine" not in st.session_state:
+        path = find_stockfish(engine_path)
+        eng = chess.engine.SimpleEngine.popen_uci(path)
+        st.session_state.engine = eng
+        st.session_state.engine_mode = configure_strength(eng, elo)
+    return st.session_state.engine, st.session_state.engine_mode
